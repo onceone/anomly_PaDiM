@@ -23,7 +23,6 @@ from torch.utils.data import DataLoader
 from torchvision.models import wide_resnet50_2, resnet18
 import datasets.mvtec as mvtec
 
-
 # device setup
 use_cuda = torch.cuda.is_available()
 device = torch.device('cuda' if use_cuda else 'cpu')
@@ -31,17 +30,13 @@ device = torch.device('cuda' if use_cuda else 'cpu')
 
 def parse_args():
     parser = argparse.ArgumentParser('PaDiM')
-    parser.add_argument('--data_path', type=str, default='D:/dataset/mvtec_anomaly_detection')
+    parser.add_argument('--data_path', type=str, default='/home/w/Project/DataSets/anom/mvtec/')
     parser.add_argument('--save_path', type=str, default='./mvtec_result')
     parser.add_argument('--arch', type=str, choices=['resnet18', 'wide_resnet50_2'], default='wide_resnet50_2')
     return parser.parse_args()
 
 
-def main():
-
-    args = parse_args()
-
-    # load model
+def load_model(args):
     if args.arch == 'resnet18':
         model = resnet18(pretrained=True, progress=True)
         t_d = 448
@@ -50,19 +45,138 @@ def main():
         model = wide_resnet50_2(pretrained=True, progress=True)
         t_d = 1792
         d = 550
+    else:
+        raise 'args.arch error'
+
+    return model, t_d, d
+
+
+def embedding_concat(x, y):
+    """
+    从x中挑选“小长条”（通道数不变），“小长条”的长宽和y相同
+    :param x: (32,256,56,56)
+    :param y: (32,512,28,28)
+    :return:
+    """
+    B, C1, H1, W1 = x.size()
+    _, C2, H2, W2 = y.size()
+    s = int(H1 / H2)
+    x = F.unfold(x, kernel_size=s, dilation=1, stride=s)  # (32,256,56,56) -> (32,1024,784)
+    x = x.view(B, C1, -1, H2, W2)  # (32,1024,784) -> (32,256,4,28,28)
+    z = torch.zeros(B, C1 + C2, x.size(2), H2, W2)  # (32,768,4,28,28)
+    """简化：x长宽为4×4，y的长宽为2×2,通道数分别为6，7。我们把x横竖各切一刀，变成和y一样的长条（2，2，6），
+       然后，x的四个长条分别上边堆一个y(通道方向上垒积木），现在我们有四个长条（2，2，13 ）"""
+    for i in range(x.size(2)):
+        z[:, :, i, :, :] = torch.cat((x[:, :, i, :, :], y), 1)
+    # (32,768,4,28,28) -> (32,3072,784)
+    z = z.view(B, -1, H2 * W2)
+    """简化：四个长条在长度方向上垒在一起，每个长条有各自的长度（通道），可以看出是（1，1，4*c），fold后变成（2，2，c）,即四个长条并排放
+    """
+    # (32,3072,784) -> (32,768,56,56) 逆运算，恢复到x
+    z = F.fold(z, kernel_size=s, output_size=(H1, W1), stride=s)
+
+    return z
+
+
+def extract_train_feature(train_dataloader, args, class_name, model, idx, outputs):
+    """提取是训练集特征，保存的是处理后的均值和协方差"""
+
+    train_outputs = OrderedDict([('layer1', []), ('layer2', []), ('layer3', [])])
+    # extract train set features
+    train_feature_filepath = os.path.join(args.save_path, 'temp_%s' % args.arch, 'train_%s.pkl' % class_name)
+    if not os.path.exists(train_feature_filepath):
+        for (x, _, _) in tqdm(train_dataloader, '| feature extraction | train | %s |' % class_name):
+            # model prediction
+            with torch.no_grad():
+                p = model(x.to(device))
+            # get intermediate layer outputs
+            for k, v in zip(train_outputs.keys(), outputs):
+                train_outputs[k].append(v.cpu().detach())
+            # initialize hook outputs
+            outputs.clear()
+        for k, v in train_outputs.items():
+            train_outputs[k] = torch.cat(v, 0)
+
+        # Embedding concat
+        embedding_vectors = train_outputs['layer1']  # (209,256,56,56)
+        for layer_name in ['layer2', 'layer3']:
+            embedding_vectors = embedding_concat(embedding_vectors, train_outputs[layer_name])
+
+        # randomly select d dimension (209,1792,56,56) -> (209,550,56,56)
+        embedding_vectors = torch.index_select(embedding_vectors, 1, idx)
+        # calculate multivariate Gaussian distribution
+        B, C, H, W = embedding_vectors.size()
+        # (209,550,56,56) -> (209,550,3136)
+        embedding_vectors = embedding_vectors.view(B, C, H * W)
+        # (550,3136)
+        mean = torch.mean(embedding_vectors, dim=0).numpy()
+        cov = torch.zeros(C, C, H * W).numpy()  # (550,550,3136)
+        I = np.identity(C)
+        for i in range(H * W):  # 对角线上加一个值，使其满秩可逆
+            # cov[:, :, i] = LedoitWolf().fit(embedding_vectors[:, :, i].numpy()).covariance_
+            cov[:, :, i] = np.cov(embedding_vectors[:, :, i].numpy(), rowvar=False) + 0.01 * I
+        # save learned distribution
+        train_outputs = [mean, cov]
+        with open(train_feature_filepath, 'wb') as f:
+            pickle.dump(train_outputs, f)
+    else:
+        print('load train set feature from: %s' % train_feature_filepath)
+        with open(train_feature_filepath, 'rb') as f:
+            train_outputs = pickle.load(f)
+
+    return train_outputs
+
+
+def extract_test_features(test_dataloader, model, class_name, outputs):
+    test_outputs = OrderedDict([('layer1', []), ('layer2', []), ('layer3', [])])
+
+    gt_list = []
+    gt_mask_list = []
+    test_imgs = []
+    temp_x = None
+    # extract test set features
+    for (x, y, mask) in tqdm(test_dataloader, '| feature extraction | test | %s |' % class_name):
+        if temp_x == None:
+            temp_x = x
+        test_imgs.extend(x.cpu().detach().numpy())
+        gt_list.extend(y.cpu().detach().numpy())
+        gt_mask_list.extend(mask.cpu().detach().numpy())
+        # model prediction
+        with torch.no_grad():
+            _ = model(x.to(device))
+        # get intermediate layer outputs
+        for k, v in zip(test_outputs.keys(), outputs):
+            test_outputs[k].append(v.cpu().detach())
+        # initialize hook outputs
+        outputs.clear()
+    for k, v in test_outputs.items():
+        test_outputs[k] = torch.cat(v, 0)
+
+    # Embedding concat,通道方向上拼接
+    embedding_vectors = test_outputs['layer1']  # (83,256,56,56)
+    for layer_name in ['layer2', 'layer3']:
+        embedding_vectors = embedding_concat(embedding_vectors, test_outputs[layer_name])
+
+    return embedding_vectors, gt_list, gt_mask_list, test_imgs, temp_x
+
+
+def main():
+    args = parse_args()
+
+    model, t_d, d = load_model(args)
     model.to(device)
     model.eval()
+
+    idx = torch.tensor(random.sample(range(0, t_d), d))
     random.seed(1024)
     torch.manual_seed(1024)
     if use_cuda:
         torch.cuda.manual_seed_all(1024)
 
-    idx = torch.tensor(sample(range(0, t_d), d))
-
     # set model's intermediate outputs
     outputs = []
-
     def hook(module, input, output):
+        """钩出网络中特征的层，需要前向传播后才可"""
         outputs.append(output)
 
     model.layer1[-1].register_forward_hook(hook)
@@ -84,103 +198,44 @@ def main():
         test_dataset = mvtec.MVTecDataset(args.data_path, class_name=class_name, is_train=False)
         test_dataloader = DataLoader(test_dataset, batch_size=32, pin_memory=True)
 
-        train_outputs = OrderedDict([('layer1', []), ('layer2', []), ('layer3', [])])
-        test_outputs = OrderedDict([('layer1', []), ('layer2', []), ('layer3', [])])
+        # 提取训练集特征,[mean,cov]
+        train_outputs = extract_train_feature(train_dataloader, args, class_name, model, idx, outputs)
 
-        # extract train set features
-        train_feature_filepath = os.path.join(args.save_path, 'temp_%s' % args.arch, 'train_%s.pkl' % class_name)
-        if not os.path.exists(train_feature_filepath):
-            for (x, _, _) in tqdm(train_dataloader, '| feature extraction | train | %s |' % class_name):
-                # model prediction
-                with torch.no_grad():
-                    _ = model(x.to(device))
-                # get intermediate layer outputs
-                for k, v in zip(train_outputs.keys(), outputs):
-                    train_outputs[k].append(v.cpu().detach())
-                # initialize hook outputs
-                outputs = []
-            for k, v in train_outputs.items():
-                train_outputs[k] = torch.cat(v, 0)
+        # 提取测试集特征
+        test_embedding_vectors, gt_list, gt_mask_list, test_imgs, temp_x = extract_test_features(test_dataloader, model,
+                                                                                                 class_name, outputs)
+        # randomly select d dimension # (83,1792,56,56) -> (83,550,56,56)
+        embedding_vectors = torch.index_select(test_embedding_vectors, 1, idx)
 
-            # Embedding concat
-            embedding_vectors = train_outputs['layer1']
-            for layer_name in ['layer2', 'layer3']:
-                embedding_vectors = embedding_concat(embedding_vectors, train_outputs[layer_name])
-
-            # randomly select d dimension
-            embedding_vectors = torch.index_select(embedding_vectors, 1, idx)
-            # calculate multivariate Gaussian distribution
-            B, C, H, W = embedding_vectors.size()
-            embedding_vectors = embedding_vectors.view(B, C, H * W)
-            mean = torch.mean(embedding_vectors, dim=0).numpy()
-            cov = torch.zeros(C, C, H * W).numpy()
-            I = np.identity(C)
-            for i in range(H * W):
-                # cov[:, :, i] = LedoitWolf().fit(embedding_vectors[:, :, i].numpy()).covariance_
-                cov[:, :, i] = np.cov(embedding_vectors[:, :, i].numpy(), rowvar=False) + 0.01 * I
-            # save learned distribution
-            train_outputs = [mean, cov]
-            with open(train_feature_filepath, 'wb') as f:
-                pickle.dump(train_outputs, f)
-        else:
-            print('load train set feature from: %s' % train_feature_filepath)
-            with open(train_feature_filepath, 'rb') as f:
-                train_outputs = pickle.load(f)
-
-        gt_list = []
-        gt_mask_list = []
-        test_imgs = []
-
-        # extract test set features
-        for (x, y, mask) in tqdm(test_dataloader, '| feature extraction | test | %s |' % class_name):
-            test_imgs.extend(x.cpu().detach().numpy())
-            gt_list.extend(y.cpu().detach().numpy())
-            gt_mask_list.extend(mask.cpu().detach().numpy())
-            # model prediction
-            with torch.no_grad():
-                _ = model(x.to(device))
-            # get intermediate layer outputs
-            for k, v in zip(test_outputs.keys(), outputs):
-                test_outputs[k].append(v.cpu().detach())
-            # initialize hook outputs
-            outputs = []
-        for k, v in test_outputs.items():
-            test_outputs[k] = torch.cat(v, 0)
-        
-        # Embedding concat
-        embedding_vectors = test_outputs['layer1']
-        for layer_name in ['layer2', 'layer3']:
-            embedding_vectors = embedding_concat(embedding_vectors, test_outputs[layer_name])
-
-        # randomly select d dimension
-        embedding_vectors = torch.index_select(embedding_vectors, 1, idx)
-        
         # calculate distance matrix
         B, C, H, W = embedding_vectors.size()
-        embedding_vectors = embedding_vectors.view(B, C, H * W).numpy()
+        embedding_vectors = embedding_vectors.view(B, C, H * W).numpy()  # (83,550,3136)
         dist_list = []
         for i in range(H * W):
-            mean = train_outputs[0][:, i]
-            conv_inv = np.linalg.inv(train_outputs[1][:, :, i])
+            # train_outputs:[mean,con] mean:[550,3316],cov:[550,550,3136]
+            mean = train_outputs[0][:, i]  # [550,]
+            conv_inv = np.linalg.inv(train_outputs[1][:, :, i])  # 协方差逆阵 （550，550）
+            # 3136 * [(550,)*(550,550)*(550,)] -> (550,3136)
             dist = [mahalanobis(sample[:, i], mean, conv_inv) for sample in embedding_vectors]
             dist_list.append(dist)
-
-        dist_list = np.array(dist_list).transpose(1, 0).reshape(B, H, W)
+        # 3136*(83,) -> (83,56,56)
+        dist_list = np.array(dist_list).transpose(1, 0).reshape(B, H, W)  # (83,56,56)
 
         # upsample
-        dist_list = torch.tensor(dist_list)
-        score_map = F.interpolate(dist_list.unsqueeze(1), size=x.size(2), mode='bilinear',
+        dist_list = torch.tensor(dist_list)  # (83,56,56)
+        # (83,56,56) -> (83,1,56,56) -> (83,1,224,224) -> (83,224,224),得分图插值到测试图片大小
+        score_map = F.interpolate(dist_list.unsqueeze(1), size=temp_x.size(2), mode='bilinear',
                                   align_corners=False).squeeze().numpy()
-        
-        # apply gaussian smoothing on the score map
+
+        # apply gaussian smoothing on the score map,高斯平滑
         for i in range(score_map.shape[0]):
             score_map[i] = gaussian_filter(score_map[i], sigma=4)
-        
+
         # Normalization
         max_score = score_map.max()
         min_score = score_map.min()
         scores = (score_map - min_score) / (max_score - min_score)
-        
+
         # calculate image-level ROC AUC score
         img_scores = scores.reshape(scores.shape[0], -1).max(axis=1)
         gt_list = np.asarray(gt_list)
@@ -189,7 +244,7 @@ def main():
         total_roc_auc.append(img_roc_auc)
         print('image ROCAUC: %.3f' % (img_roc_auc))
         fig_img_rocauc.plot(fpr, tpr, label='%s img_ROCAUC: %.3f' % (class_name, img_roc_auc))
-        
+
         # get optimal threshold
         gt_mask = np.asarray(gt_mask_list)
         precision, recall, thresholds = precision_recall_curve(gt_mask.flatten(), scores.flatten())
@@ -279,23 +334,8 @@ def denormalization(x):
     mean = np.array([0.485, 0.456, 0.406])
     std = np.array([0.229, 0.224, 0.225])
     x = (((x.transpose(1, 2, 0) * std) + mean) * 255.).astype(np.uint8)
-    
+
     return x
-
-
-def embedding_concat(x, y):
-    B, C1, H1, W1 = x.size()
-    _, C2, H2, W2 = y.size()
-    s = int(H1 / H2)
-    x = F.unfold(x, kernel_size=s, dilation=1, stride=s)
-    x = x.view(B, C1, -1, H2, W2)
-    z = torch.zeros(B, C1 + C2, x.size(2), H2, W2)
-    for i in range(x.size(2)):
-        z[:, :, i, :, :] = torch.cat((x[:, :, i, :, :], y), 1)
-    z = z.view(B, -1, H2 * W2)
-    z = F.fold(z, kernel_size=s, output_size=(H1, W1), stride=s)
-
-    return z
 
 
 if __name__ == '__main__':
