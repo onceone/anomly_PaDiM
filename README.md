@@ -1,4 +1,16 @@
 # PaDiM-Anomaly-Detection-Localization-master
+
+
+------------------------
+2022.11.3
+
+On the basis of [[xiahaifeng1995](https://github.com/xiahaifeng1995)](https://github.com/xiahaifeng1995/PaDiM-Anomaly-Detection-Localization-master)
+ code, the code has been formatted and added some comments
+
+-------------------
+
+
+
 This is an implementation of the paper [PaDiM: a Patch Distribution Modeling Framework for Anomaly Detection and Localization](https://arxiv.org/pdf/2011.08785).   
 
 This code is heavily borrowed from both SPADE-pytorch(https://github.com/byungjae89/SPADE-pytorch) and MahalanobisAD-pytorch(https://github.com/byungjae89/MahalanobisAD-pytorch) projects
